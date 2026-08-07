@@ -15,5 +15,9 @@
   "author": "SentinelNet Contributors",
   "engines": {
     "node": ">=14"
+  },
+  "dependencies": {
+    "minimist": "^1.2.8"
   }
 }
+
