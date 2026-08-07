@@ -24,19 +24,12 @@ print(
     .value_counts()
 )
 
-features = [
-
-    "Flow Duration",
-
-    "Total Fwd Packets",
-
-    "Total Backward Packets",
-
-    "Flow Bytes/s",
-
-    "Flow Packets/s"
-
-]
+# Auto-select numeric features (exclude Label) to give the model more signal
+numeric = df.select_dtypes(include=['number']).columns.tolist()
+if 'Label' in numeric:
+    numeric.remove('Label')
+features = numeric
+print("Using features:", features)
 
 df = df[
     features + [

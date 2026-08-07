@@ -6,12 +6,16 @@ import json
 import time
 import socket
 import threading
+import joblib
+import pandas as pd
 
 INTERFACE = r"\Device\NPF_Loopback"
 
 import os
 _DIR = os.path.dirname(os.path.abspath(__file__))
 ALERT_FILE = os.path.join(_DIR, "..", "shared", "alerts.json")
+ALERT_JSONL = os.path.join(_DIR, "..", "shared", "alerts.jsonl")
+BLOCKED_FILE = os.path.join(_DIR, "..", "shared", "blocked.json")
 
 WINDOW = 30
 
@@ -19,6 +23,68 @@ tcp_tracker = defaultdict(dict)
 udp_tracker = defaultdict(dict)
 
 last_attack = None
+
+# Optional ML model and per-source stats
+MODEL_FILE = os.path.join(_DIR, "..", "models", "cic_model.pkl")
+ENCODER_FILE = os.path.join(_DIR, "..", "models", "cic_encoder.pkl")
+model = None
+encoder = None
+try:
+    model = joblib.load(MODEL_FILE)
+    encoder = joblib.load(ENCODER_FILE)
+    print("Loaded ML model and encoder")
+except Exception as e:
+    model = None
+    encoder = None
+    print("ML model not loaded:", e)
+
+packet_counts = defaultdict(int)
+byte_counts = defaultdict(int)
+first_seen = {}
+
+# Detection configuration (tunable thresholds)
+PORTSCAN_THRESHOLD = 20        # unique destination ports in WINDOW -> PortScan
+UDPSCAN_THRESHOLD = 5          # unique UDP ports in WINDOW -> UDP_SCAN
+SYN_FLOOD_THRESHOLD = 50       # SYN packets in WINDOW -> SYN_FLOOD
+ICMP_FLOOD_THRESHOLD = 50      # ICMP packets in WINDOW -> ICMP_FLOOD
+SLOWLORIS_THRESHOLD = 30       # many small TCP payloads in WINDOW -> SLOWLORIS
+WINDOW = 30                    # sliding window in seconds for rate-based checks
+BLOCK_ENABLED = True           # whether to auto-block high severity IPs
+BLOCK_COOLDOWN = 300           # seconds to wait before re-blocking same IP
+
+# Data breach / exfiltration thresholds
+DATA_EXFIL_BYTES_TOTAL = 5 * 1024 * 1024   # total bytes in WINDOW considered exfiltration (5 MB)
+DATA_EXFIL_RATE = 1 * 1024 * 1024          # bytes/sec rate that flags exfil (1 MB/s)
+
+# Rate limiter configuration
+RATE_LIMIT_PKT_PER_SEC = 200              # packets per second threshold
+RATE_LIMIT_WINDOW = 5                     # seconds window for rate limiting
+RATE_LIMIT_COOLDOWN = 60                  # seconds to ignore/process after rate limit
+
+# Trackers for advanced detection
+syn_timestamps = defaultdict(list)
+icmp_timestamps = defaultdict(list)
+small_payload_timestamps = defaultdict(list)
+packet_timestamps = defaultdict(list)
+rate_limited = {}
+blocked_ips = {}
+last_block_time = {}
+
+# Load persistent blocked IPs if present
+try:
+    if os.path.exists(BLOCKED_FILE):
+        with open(BLOCKED_FILE, 'r', encoding='utf-8') as _bf:
+            data = _bf.read().strip()
+            if data:
+                loaded = json.loads(data)
+                if isinstance(loaded, dict):
+                    blocked_ips.update(loaded)
+                elif isinstance(loaded, list):
+                    # list of IPs -> set current time
+                    for ip in loaded:
+                        blocked_ips[ip] = time.time()
+except Exception as e:
+    print('Failed to load blocked file:', e)
 
 MY_IP = socket.gethostbyname(
     socket.gethostname()
@@ -30,43 +96,103 @@ print(
 )
 
 
-def save_alert(alert):
-
-    alerts = []
-
-    try:
-
-        with open(
-            ALERT_FILE,
-            "r"
-        ) as f:
-
-            content = f.read()
-
-            if content.strip():
-
-                alerts = json.loads(
-                    content
-                )
-
-    except:
-
-        alerts = []
-
-    alerts.append(
-        alert
+def block_ip(ip):
+    # Blocking wrapper using netsh (Windows). Silently ignore localhost and private ranges.
+    if not BLOCK_ENABLED:
+        return
+    if ip == '127.0.0.1' or ip.startswith('192.168.') or ip.startswith('10.'):
+        # avoid blocking common local ranges by default
+        return
+    now = time.time()
+    last = last_block_time.get(ip, 0)
+    if now - last < BLOCK_COOLDOWN:
+        return
+    cmd = (
+        f'netsh advfirewall firewall '
+        f'add rule '
+        f'name="SentinelBlock_{ip}" '
+        f'dir=in '
+        f'action=block '
+        f'remoteip={ip}'
     )
 
-    with open(
-        ALERT_FILE,
-        "w"
-    ) as f:
+    # Attempt to block at OS level, but always persist blocked list
+    try:
+        rc = os.system(cmd)
+        print(f'netsh exit code: {rc}')
+    except Exception as e:
+        print('Failed to execute netsh:', e)
 
-        json.dump(
-            alerts,
-            f,
-            indent=4
-        )
+    # Record in memory and persist
+    try:
+        last_block_time[ip] = now
+        blocked_ips[ip] = now
+        with open(BLOCKED_FILE, 'w', encoding='utf-8') as bf:
+            json.dump(blocked_ips, bf)
+        print(f'Persisted blocked IP {ip} to {BLOCKED_FILE}')
+    except Exception as e:
+        print('Failed to persist blocked IP:', e)
+
+
+def save_alert(alert):
+
+    # Append each alert as a single JSON line to alerts.jsonl for atomic appends
+    try:
+        with open(ALERT_JSONL, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(alert, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print('Failed to append alert to jsonl:', e)
+        # Fallback: try to write to ALERT_FILE atomically
+        try:
+            alerts = []
+            if os.path.exists(ALERT_FILE):
+                with open(ALERT_FILE, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if content.strip():
+                        alerts = json.loads(content)
+            alerts.append(alert)
+            tmp = ALERT_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(alerts, f, indent=4)
+            os.replace(tmp, ALERT_FILE)
+        except Exception as e2:
+            print('Fallback write failed:', e2)
+
+
+# Background writer: periodically consolidates alerts.jsonl into alerts.json (atomic replace)
+def alerts_jsonl_to_json():
+    tmp = ALERT_FILE + '.tmp'
+    while True:
+        try:
+            if os.path.exists(ALERT_JSONL):
+                alerts = []
+                with open(ALERT_JSONL, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            alerts.append(json.loads(line))
+                        except Exception as e:
+                            # skip malformed line
+                            print('Skipping malformed JSONL line:', e)
+                # Write atomically
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(alerts, f, indent=4)
+                try:
+                    os.replace(tmp, ALERT_FILE)
+                except Exception:
+                    try:
+                        os.remove(ALERT_FILE)
+                    except Exception:
+                        pass
+                    os.replace(tmp, ALERT_FILE)
+        except Exception as e:
+            print('alerts_jsonl_to_json error:', e)
+        time.sleep(2)
+
+# Start consolidation thread
+threading.Thread(target=alerts_jsonl_to_json, daemon=True).start()
 
 
 def create_alert(
@@ -231,8 +357,41 @@ def process(packet):
         if src == MY_IP:
             return
 
-        try:
+        # Ignore already-blocked IPs immediately
+        if src in blocked_ips:
+            # If within cooldown, skip processing
+            last_blk = blocked_ips.get(src, 0)
+            if time.time() - last_blk < BLOCK_COOLDOWN:
+                print(f'Ignored packet from blocked IP {src}')
+                return
 
+        # Rate limiter: track packet arrival timestamps and apply cooldown
+        now = time.time()
+        packet_timestamps[src].append(now)
+        # prune timestamps older than RATE_LIMIT_WINDOW
+        packet_timestamps[src] = [t for t in packet_timestamps[src] if now - t < RATE_LIMIT_WINDOW]
+        # compute rate (per-second approximate)
+        recent_count = len([t for t in packet_timestamps[src] if now - t < 1])
+        if src in rate_limited:
+            # still in cooldown?
+            if now - rate_limited[src] < RATE_LIMIT_COOLDOWN:
+                # drop processing to reduce load
+                print(f'Rate-limited: dropping packet from {src}')
+                return
+            else:
+                del rate_limited[src]
+
+        if recent_count >= RATE_LIMIT_PKT_PER_SEC:
+            # Trigger rate-limit action
+            rate_limited[src] = now
+            print(f'Rate limit triggered for {src} (pkts/s={recent_count})')
+            try:
+                create_alert('RATE_LIMIT', src, recent_count, 'Unknown Device', 'Unknown', [])
+            except Exception:
+                pass
+            return
+
+        try:
             host = socket.gethostbyaddr(
                 src
             )[0]
@@ -281,17 +440,115 @@ def process(packet):
                 f"TCP PORTS={ports}"
             )
 
-            if ports >= 20:
+            # Update simple per-source counters
+            packet_counts[src] += 1
+            try:
+                byte_counts[src] += len(packet)
+            except Exception:
+                byte_counts[src] += 0
+            if src not in first_seen:
+                first_seen[src] = time.time()
 
-                attack = "PortScan"
+            now = time.time()
+            # TCP flags - robust check using bitmask
+            try:
+                tcp_flags_val = int(packet['TCP'].flags)
+            except Exception:
+                try:
+                    tcp_flags_val = int(str(packet['TCP'].flags))
+                except Exception:
+                    tcp_flags_val = 0
 
-            elif ports >= 10:
+            # SYN flag is 0x02
+            if tcp_flags_val & 0x02:
+                syn_timestamps[src].append(now)
+                # prune old
+                syn_timestamps[src] = [t for t in syn_timestamps[src] if now - t < WINDOW]
 
-                attack = "SUSPICIOUS"
+            # Update small-payload tracker for Slowloris-like behavior
+            try:
+                payload_len = len(bytes(packet['TCP'].payload))
+            except Exception:
+                payload_len = 0
 
-            else:
+            if payload_len > 0 and payload_len < 200:
+                small_payload_timestamps[src].append(now)
+                small_payload_timestamps[src] = [t for t in small_payload_timestamps[src] if now - t < WINDOW]
 
-                attack = "BENIGN"
+            # Decide attack by priority: SYN flood, portscan, slowloris, ML/heuristic
+            attack = None
+
+            # SYN flood detection
+            if len(syn_timestamps[src]) >= SYN_FLOOD_THRESHOLD:
+                attack = 'SYN_FLOOD'
+
+            # Port scan override
+            if attack is None and ports >= PORTSCAN_THRESHOLD:
+                attack = 'PortScan'
+
+            # Slowloris detection
+            if attack is None and len(small_payload_timestamps[src]) >= SLOWLORIS_THRESHOLD:
+                attack = 'SLOWLORIS'
+
+            # If still undecided, use ML or fallback heuristic
+            if attack is None:
+                if model is not None:
+                    duration = now - first_seen.get(src, now)
+                    if duration <= 0:
+                        duration = 0.0001
+                    try:
+                        feature_cols = getattr(model, 'feature_names_in_', None)
+                        if feature_cols is not None:
+                            row = {c: 0.0 for c in feature_cols}
+                            row.update({
+                                'Flow Duration': duration,
+                                'Total Fwd Packets': packet_counts[src],
+                                'Total Backward Packets': 0,
+                                'Flow Bytes/s': byte_counts[src] / duration,
+                                'Flow Packets/s': packet_counts[src] / duration
+                            })
+                            X_row = pd.DataFrame([row], columns=feature_cols)
+                        else:
+                            X_row = pd.DataFrame([{
+                                'Flow Duration': duration,
+                                'Total Fwd Packets': packet_counts[src],
+                                'Total Backward Packets': 0,
+                                'Flow Bytes/s': byte_counts[src] / duration,
+                                'Flow Packets/s': packet_counts[src] / duration
+                            }])
+                    except Exception:
+                        X_row = pd.DataFrame([{
+                            'Flow Duration': duration,
+                            'Total Fwd Packets': packet_counts[src],
+                            'Total Backward Packets': 0,
+                            'Flow Bytes/s': byte_counts[src] / duration,
+                            'Flow Packets/s': packet_counts[src] / duration
+                        }])
+                    try:
+                        pred = model.predict(X_row)[0]
+                        try:
+                            attack = encoder.inverse_transform([pred])[0]
+                        except Exception:
+                            attack = str(pred)
+                    except Exception as e:
+                        print('Model prediction failed:', e)
+                        # fallback to heuristic
+                        if ports >= 10:
+                            attack = 'SUSPICIOUS'
+                        else:
+                            attack = 'BENIGN'
+                else:
+                    if ports >= 10:
+                        attack = 'SUSPICIOUS'
+                    else:
+                        attack = 'BENIGN'
+
+            # If a high-severity network attack detected, block the IP
+            if attack in ('SYN_FLOOD', 'SYN_FLOOD', 'PortScan', 'SLOWLORIS'):
+                try:
+                    block_ip(src)
+                except Exception as e:
+                    print('Auto-block failed:', e)
 
         elif packet.haslayer(
             "UDP"
@@ -323,17 +580,94 @@ def process(packet):
                 f"UDP PORTS={ports}"
             )
 
-            if ports >= 5:
+            # Update per-source counters
+            packet_counts[src] += 1
+            try:
+                byte_counts[src] += len(packet)
+            except Exception:
+                byte_counts[src] += 0
+            if src not in first_seen:
+                first_seen[src] = time.time()
 
+            # Prefer heuristic override for clear UDP scans
+            if ports >= UDPSCAN_THRESHOLD:
                 attack = "UDP_SCAN"
 
-            elif ports >= 3:
-
-                attack = "SUSPICIOUS"
-
             else:
+                # small UDP flows still analyzed by ML if available
+                if model is not None:
+                    now = time.time()
+                    duration = now - first_seen.get(src, now)
+                    if duration <= 0:
+                        duration = 0.0001
+                    try:
+                        feature_cols = getattr(model, 'feature_names_in_', None)
+                        if feature_cols is not None:
+                            row = {c: 0.0 for c in feature_cols}
+                            row.update({
+                                "Flow Duration": duration,
+                                "Total Fwd Packets": packet_counts[src],
+                                "Total Backward Packets": 0,
+                                "Flow Bytes/s": byte_counts[src] / duration,
+                                "Flow Packets/s": packet_counts[src] / duration
+                            })
+                            X_row = pd.DataFrame([row], columns=feature_cols)
+                        else:
+                            X_row = pd.DataFrame([{
+                                "Flow Duration": duration,
+                                "Total Fwd Packets": packet_counts[src],
+                                "Total Backward Packets": 0,
+                                "Flow Bytes/s": byte_counts[src] / duration,
+                                "Flow Packets/s": packet_counts[src] / duration
+                            }])
+                    except Exception:
+                        X_row = pd.DataFrame([{
+                            "Flow Duration": duration,
+                            "Total Fwd Packets": packet_counts[src],
+                            "Total Backward Packets": 0,
+                            "Flow Bytes/s": byte_counts[src] / duration,
+                            "Flow Packets/s": packet_counts[src] / duration
+                        }])
+                    try:
+                        pred = model.predict(X_row)[0]
+                        try:
+                            attack = encoder.inverse_transform([pred])[0]
+                        except Exception:
+                            attack = str(pred)
+                    except Exception as e:
+                        print("Model prediction failed:", e)
+                        # fallback heuristic
+                        if ports >= UDPSCAN_THRESHOLD:
+                            attack = "UDP_SCAN"
+                        elif ports >= 3:
+                            attack = "SUSPICIOUS"
+                        else:
+                            attack = "BENIGN"
+                else:
+                    if ports >= UDPSCAN_THRESHOLD:
+                        attack = "UDP_SCAN"
+                    elif ports >= 3:
+                        attack = "SUSPICIOUS"
+                    else:
+                        attack = "BENIGN"
 
-                attack = "BENIGN"
+        elif packet.haslayer(
+            "ICMP"
+        ):
+            # ICMP flood detection
+            try:
+                icmp_timestamps[src].append(time.time())
+                now = time.time()
+                icmp_timestamps[src] = [t for t in icmp_timestamps[src] if now - t < WINDOW]
+                ports = len(icmp_timestamps[src])
+                port_list = []
+                if ports >= ICMP_FLOOD_THRESHOLD:
+                    attack = 'ICMP_FLOOD'
+                else:
+                    attack = 'BENIGN'
+            except Exception as e:
+                print('ICMP processing error:', e)
+                return
 
         else:
 
@@ -361,6 +695,15 @@ def process(packet):
                 port_list
 
             )
+
+            # Auto-block high severity attacks
+            try:
+                if attack in ("PortScan", "SYN_FLOOD", "ICMP_FLOOD", "SLOWLORIS"):
+                    block_ip(src)
+                elif attack == "UDP_SCAN" and ports >= 10:
+                    block_ip(src)
+            except Exception as e:
+                print('Block after alert failed:', e)
 
     except Exception as e:
 
