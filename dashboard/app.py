@@ -411,3 +411,7 @@ if st.button(
     st.success(
         "Report saved"
     )
+
+import time
+time.sleep(2)
+st.rerun()

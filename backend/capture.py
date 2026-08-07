@@ -9,7 +9,9 @@ import threading
 
 INTERFACE = r"\Device\NPF_Loopback"
 
-ALERT_FILE = "../shared/alerts.json"
+import os
+_DIR = os.path.dirname(os.path.abspath(__file__))
+ALERT_FILE = os.path.join(_DIR, "..", "shared", "alerts.json")
 
 WINDOW = 30
 
