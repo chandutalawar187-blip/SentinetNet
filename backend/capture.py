@@ -9,13 +9,72 @@ import threading
 import joblib
 import pandas as pd
 
-INTERFACE = r"\Device\NPF_Loopback"
-
+# Interface can be provided via CLI --iface or SENTINET_INTERFACE env var
 import os
+import argparse
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument('--iface', default=None)
+args, _ = parser.parse_known_args()
+
+INTERFACE = args.iface or os.environ.get('SENTINET_INTERFACE')
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 ALERT_FILE = os.path.join(_DIR, "..", "shared", "alerts.json")
 ALERT_JSONL = os.path.join(_DIR, "..", "shared", "alerts.jsonl")
 BLOCKED_FILE = os.path.join(_DIR, "..", "shared", "blocked.json")
+
+# Normalize interface argument: accept interface name, IP address (map to OS interface), or tokens like 'loopback'
+if not INTERFACE:
+    INTERFACE = None
+else:
+    # Attempt to map IP -> interface name using scapy's get_if_list/get_if_addr where possible
+    try:
+        import ipaddress
+        from scapy.all import get_if_list, get_if_addr
+        is_ip = False
+        try:
+            ipaddress.ip_address(INTERFACE)
+            is_ip = True
+        except Exception:
+            is_ip = False
+
+        mapped_iface = None
+        if is_ip:
+            for ifname in get_if_list():
+                try:
+                    addr = get_if_addr(ifname)
+                    if addr == INTERFACE:
+                        mapped_iface = ifname
+                        break
+                except Exception:
+                    continue
+            # common token fallback for loopback IPs
+            if not mapped_iface and INTERFACE.startswith('127.'):
+                for ifname in get_if_list():
+                    if 'loop' in ifname.lower() or ifname.lower().startswith('lo'):
+                        mapped_iface = ifname
+                        break
+        else:
+            # Accept tokens like 'loopback' or 'lo'
+            if INTERFACE.lower() in ('loopback', 'lo'):
+                for ifname in get_if_list():
+                    if 'loop' in ifname.lower() or ifname.lower().startswith('lo'):
+                        mapped_iface = ifname
+                        break
+            else:
+                mapped_iface = INTERFACE
+
+        if mapped_iface:
+            INTERFACE = mapped_iface
+            print(f"Mapped interface token/IP to OS interface: {INTERFACE}")
+        else:
+            print(f"Warning: could not map interface '{INTERFACE}' to an OS interface; using scapy default (None)")
+            INTERFACE = None
+    except Exception as e:
+        print('Interface mapping disabled or failed:', e)
+        # fallback to using the provided string as-is
+        print(f"Using interface: {INTERFACE}")
 
 WINDOW = 30
 
