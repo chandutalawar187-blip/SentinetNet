@@ -1,0 +1,19 @@
+{
+  "name": "sentinetnet",
+  "version": "0.1.0",
+  "description": "SentinelNet cross-platform intrusion detection wrapper (Node API) that runs the Python detector and exposes alerts.",
+  "main": "lib/index.js",
+  "bin": {
+    "sentinetnet": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node lib/index.js",
+    "test": "node lib/index.js --help"
+  },
+  "keywords": ["security","ids","intrusion-detection","network","sentinel"],
+  "license": "MIT",
+  "author": "SentinelNet Contributors",
+  "engines": {
+    "node": ">=14"
+  }
+}

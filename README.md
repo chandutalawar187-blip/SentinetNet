@@ -49,8 +49,29 @@ Notes
 - Models and encoders are pre-saved in models/*.pkl. If you retrain, back them up.
 - alerts.json contains sample alert data used by the dashboard.
 
+NPM Package
+This repository now includes a Node wrapper package so projects can run SentinelNet from Node environments.
+
+Install locally (from repo root):
+
+  npm install -g .
+
+Usage (CLI):
+
+  sentinetnet --iface "<interface name>"
+
+Usage (programmatic):
+
+  const Sentinet = require('sentinetnet');
+  const s = new Sentinet({ iface: 'eth0', pythonPath: 'python' });
+  s.on('alert', a => console.log('ALERT', a));
+  s.start();
+
+Cross-platform note
+- The Python capture script accepts --iface or the SENTINET_INTERFACE env var. If not provided, scapy's default interface is used (listens on available interfaces). This makes the tool universal across servers.
+
 Contributing
 Open an issue or submit a PR with bug fixes or improvements.
 
 License
-Add your preferred license here.
+This project is MIT licensed (see LICENSE file).
