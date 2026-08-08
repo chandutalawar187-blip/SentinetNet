@@ -41,7 +41,7 @@ Place screenshots in the `screenshots/` folder with these filenames and they wil
 
 Example Markdown to embed screenshots:
 
-![Dashboard](screenshots/dashboard.png)
+![Dashboard](https://raw.githubusercontent.com/chandutalawar187-blip/SentinetNet/main/screenshots/dashboard.png)
 
 If you want me to add actual screenshots to the repo, upload the image files or allow me to generate placeholders and I'll add them into `screenshots/`.
 
