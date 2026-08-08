@@ -375,16 +375,8 @@ The dashboard provides a visual interface for inspecting detection activity and 
 ### Alerts
 
 <p align="center">
-  <img src="screenshots/alerts.png" alt="SentinetNet Alerts" width="900">
+  <img src="screenshots/alerts-1.png" alt="SentinetNet Alerts" width="900">
 </p>
-
-### Detection Example
-
-<p align="center">
-  <img src="screenshots/detection-example.png" alt="SentinetNet Detection Example" width="900">
-</p>
-
-> If screenshots are not available in your checkout, these images can be removed from this section until the corresponding files are added.
 
 ---
 
