@@ -22,7 +22,7 @@ jobs:
           node-version: '18'
           registry-url: 'https://npm.pkg.github.com'
           always-auth: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PUBLISH_TOKEN }}
 
       - name: Install and build (if required)
         run: |
@@ -30,6 +30,6 @@ jobs:
 
       - name: Publish to GitHub Packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
         run: |
           npm publish --registry https://npm.pkg.github.com --access public
